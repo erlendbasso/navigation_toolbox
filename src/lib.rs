@@ -45,9 +45,11 @@ pub fn gravity_ecef(r_eb_e: &Vector3<f64>) -> Vector3<f64> {
     let r_norm = r_eb_e.norm();
 
     let z_scale = 5.0 * r_eb_e[2] * r_eb_e[2] / (r_norm * r_norm);
-    let gamma = - mu / f64::powi(r_norm, 3) * (r_eb_e + 3.0 / 2.0 * J_2 * f64::powi(a, 2) / f64::powi(r_norm, 2) *  Vector3::new((1.0 - z_scale ) * r_eb_e[0], 
-                                                (1.0 - z_scale) * r_eb_e[1], 
-                                                (3.0 - z_scale) * r_eb_e[2]));
+    let gamma = - mu / f64::powi(r_norm, 3) * (r_eb_e + 1.5 * J_2 
+        * f64::powi(a, 2) / f64::powi(r_norm, 2) 
+        *  Vector3::new((1.0 - z_scale ) * r_eb_e[0], 
+                        (1.0 - z_scale) * r_eb_e[1], 
+                        (3.0 - z_scale) * r_eb_e[2]));
 
     gamma + f64::powi(omega_ie, 2) * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, 0.0)) * r_eb_e
 }
@@ -73,6 +75,22 @@ pub fn quat_ned_ecef(lat: f64, lon: f64) -> UnitQuaternion<f64> {
     );
 
     UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(rot_ned_ecef))
+}
+
+pub fn rot_ned_ecef(lat: f64, lon: f64) -> Matrix3<f64> {
+    Matrix3::new(
+        -f64::sin(lat) * f64::cos(lon), -f64::sin(lat) * f64::sin(lon), f64::cos(lat),
+        -f64::sin(lon), f64::cos(lon), 0.0,
+        -f64::cos(lat) * f64::cos(lon), -f64::cos(lat) * f64::sin(lon), -f64::sin(lat)
+    )
+}
+
+pub fn rot_ecef_ned(lat: f64, lon: f64) -> Matrix3<f64> {
+    Matrix3::new(
+        -f64::sin(lat) * f64::cos(lon), -f64::sin(lon), -f64::cos(lat) * f64::cos(lon),
+        -f64::sin(lat) * f64::sin(lon), f64::cos(lon), -f64::cos(lat) * f64::sin(lon),
+        f64::cos(lat), 0.0, -f64::sin(lat)
+    )
 }
 
 pub fn lat_height_to_grav_accel_ned(lat: f64, height: f64) -> Vector3<f64> {
