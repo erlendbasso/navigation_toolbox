@@ -36,6 +36,20 @@ pub fn lat_lon_height_to_ecef(lat: f64, lon: f64, height: f64) -> Vector3<f64> {
     )
 }
 
+pub fn omega_en_n(lat: f64, height: f64, vel_eb_n: Vector3<f64>) -> Vector3<f64> {
+    let a = WGS84.a;
+    let e = 0.08181919;
+
+    let radius_e = a / f64::sqrt( 1.0 - f64::powi(e, 2) * f64::powi(f64::sin(lat), 2) );
+    let radius_n = a * (1.0 - f64::powi(e, 2)) / f64::powf( 1.0 - f64::powi(e, 2) * f64::powi(f64::sin(lat), 2), 1.5);
+
+    Vector3::new(
+      vel_eb_n[1] / (radius_e + height),
+      - vel_eb_n[0] / (radius_n + height),
+      -vel_eb_n[1] * f64::tan(lat) / (radius_e + height)
+    )
+}
+
 pub fn gravity_ecef(r_eb_e: &Vector3<f64>) -> Vector3<f64> {
     let a           = 6378137.0;        // WGS84 equatorial radius in meters
     let mu          = 3.986004418e14; // WGS84 Earth gravitational constant (m^3 s^-2)
