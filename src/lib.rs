@@ -58,9 +58,9 @@ pub fn gravity_ecef(r_eb_e: &Vector3<f64>) -> Vector3<f64> {
 
     let r_norm = r_eb_e.norm();
 
-    let z_scale = 5.0 * r_eb_e[2] * r_eb_e[2] / (r_norm * r_norm);
+    let z_scale = 5.0 * f64::powi(r_eb_e[2] / r_norm, 2);
     let gamma = - mu / f64::powi(r_norm, 3) * (r_eb_e + 1.5 * J_2 
-        * f64::powi(a, 2) / f64::powi(r_norm, 2) 
+        * f64::powi(a / r_norm, 2) 
         *  Vector3::new((1.0 - z_scale ) * r_eb_e[0], 
                         (1.0 - z_scale) * r_eb_e[1], 
                         (3.0 - z_scale) * r_eb_e[2]));
@@ -162,5 +162,16 @@ mod tests {
         let r_eb_e = lat_lon_height_to_ecef(lat, lon, height);
 
         assert_relative_eq!(r_eb_e, Vector3::new(2.859253e6, 0.504163e6, 5.660022e6), epsilon = 1.0);
+    }
+
+    #[test]
+    fn gravity_ecef_test() {
+        let p_eb = Vector3::new(2.859253e6, 0.504163e6, 5.660022e6);
+
+        let grav = gravity_ecef(&p_eb);      
+        print!("gravity: {}", grav);  
+
+        assert_relative_eq!(grav, Vector3::new(-4.3910, -0.7742, -8.7509), epsilon = 0.0001);
+
     }
 }
