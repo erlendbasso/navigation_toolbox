@@ -172,7 +172,7 @@ mod tests {
         let p_eb = Vector3::new(2.859253e6, 0.504163e6, 5.660022e6);
 
         let grav = gravity_ecef(&p_eb);      
-        print!("gravity: {}", grav);  
+        // println!("gravity: {}", grav);  
 
         assert_relative_eq!(grav, Vector3::new(-4.3910, -0.7742, -8.7509), epsilon = 0.0001);
 
