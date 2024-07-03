@@ -12,6 +12,6 @@ keywords = ["navigation", "gnss", "no_std"]
 
 [dependencies]
 # nalgebra = "0.32"
-nalgebra = {version = "0.32", default-features = false, features = ["libm"]}
+nalgebra = {version = "0.33", default-features = false, features = ["libm"]}
 approx = "0.5.1"
 libm = "0.2"
