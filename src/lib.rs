@@ -254,11 +254,12 @@ mod tests {
 
     #[test]
     fn comp_lat_lon_height_test() {
-        let p_eb = Vector3::new(
-            2.859253064142754e6,
-            0.504163459881719e6,
-            5.660022675067442e6,
-        );
+        // let p_eb = Vector3::new(
+        //     2.859253064142754e6,
+        //     0.504163459881719e6,
+        //     5.660022675067442e6,
+        // );
+        let p_eb = Vector3::new(2.812917e6, 0.5136468e6, 5.6821953e6);
 
         let (lat, lon, height) = comp_lat_lon_height(&p_eb);
         println!(
@@ -267,6 +268,9 @@ mod tests {
             lon * 180.0 / PI,
             height
         );
+
+        let pos_ecef = lat_lon_height_to_ecef(lat, lon, height);
+        println!("pos_ecef: {}", pos_ecef);
 
         // assert_relative_eq!(
         //     grav,
