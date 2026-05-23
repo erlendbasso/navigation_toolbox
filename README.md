@@ -4,10 +4,12 @@ Small `no_std` Rust utilities for navigation math:
 
 - WGS84 geodetic latitude/longitude/height to ECEF conversion
 - ECEF to geodetic latitude/longitude/height conversion
-- ECEF/NED direction cosine matrices and quaternion helper
-- NED transport rate
+- Analytic LLH-to-ECEF and ECEF/NED rotation Jacobians
+- ECEF/NED direction cosine matrices, quaternion helper, and Earth-rate helpers
+- NED transport and inertial rates
 - ECEF and NED gravity
 - ECEF gravity gradient for linearized filters
+- SO(3)/SE(3) primitives for estimator and strapdown math
 
 ## Conventions
 
@@ -17,8 +19,25 @@ Small `no_std` Rust utilities for navigation math:
 - Accelerations are meters per second squared.
 - NED vectors are ordered `[north, east, down]`.
 - ECEF vectors are ordered `[x, y, z]`.
+- SE(3) twist helpers use `[translation, rotation]` ordering.
 
 The crate is currently `#![no_std]` and uses `nalgebra` with its `libm` feature.
+
+## Math and Linearization Helpers
+
+The crate includes small deterministic helpers commonly duplicated across
+navigation filters:
+
+- `skew`, `rotx`, `roty`, `rotz`, and `wrap_to_pi`
+- `so3_exp`, `so3_left_jacobian`, `se3_exp`, and `ad_se3`
+- `quat_update_from_rotation_vector` and `quat_to_mrp4x`
+- `lat_lon_height_to_ecef_jacobian`
+- `rot_ned_ecef_jacobian_lat` and `rot_ned_ecef_jacobian_lon`
+- `earth_rate_ecef`, `earth_rate_ned`, and `omega_in_n`
+
+These helpers are intentionally stateless. Full EKF engines, timestamp buffers,
+sensor models, alignment routines, and coning/sculling accumulators should live
+in higher-level crates that can own their runtime assumptions.
 
 ## Gravity Model
 
@@ -63,9 +82,11 @@ The API keeps simple return types and uses NaNs for invalid or singular inputs:
 ```rust
 use core::f64::consts::PI;
 use navigation_toolbox::{
-    comp_lat_lon_height, gravity_ecef, gravity_gradient_ecef, gravity_ned,
-    lat_lon_height_to_ecef, rot_ned_ecef,
+    comp_lat_lon_height, earth_rate_ned, gravity_ecef, gravity_gradient_ecef,
+    gravity_ned, lat_lon_height_to_ecef, lat_lon_height_to_ecef_jacobian,
+    rot_ned_ecef, rot_ned_ecef_jacobian_lat, so3_exp,
 };
+use nalgebra::Vector3;
 
 let lat = 63.0 * PI / 180.0;
 let lon = 10.0 * PI / 180.0;
@@ -78,6 +99,10 @@ let g_ecef = gravity_ecef(&r_ecef);
 let g_ned = gravity_ned(lat, lon, height);
 let gravity_jacobian = gravity_gradient_ecef(&r_ecef);
 let c_n_e = rot_ned_ecef(lat, lon);
+let llh_jacobian = lat_lon_height_to_ecef_jacobian(lat, lon, height);
+let c_n_e_lat_jacobian = rot_ned_ecef_jacobian_lat(lat, lon);
+let omega_ie_n = earth_rate_ned(lat, lon);
+let small_rotation = so3_exp(&Vector3::new(0.001, 0.0, 0.0));
 ```
 
 ## Verification
@@ -89,6 +114,10 @@ The test suite covers:
 - exact polar-axis ECEF-to-geodetic handling
 - zero-vector singular behavior
 - rotation inverse and orthonormality
+- LLH-to-ECEF Jacobian against central finite differences
+- ECEF/NED rotation Jacobians against central finite differences
 - quaternion/rotation-matrix consistency
+- SO(3), SE(3), quaternion-update, MRP, and Earth-rate helpers
 - gravity sanity checks
-- `gravity_gradient_ecef` against central finite differences
+- `gravity_gradient_ecef` against central finite differences at multiple
+  locations

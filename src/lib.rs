@@ -1,8 +1,8 @@
 #![no_std]
 #![allow(non_snake_case)]
 
-//! Navigation helper functions for WGS84 geodesy, ECEF/NED frame transforms, and
-//! a simple Earth gravity model.
+//! Navigation helper functions for WGS84 geodesy, ECEF/NED frame transforms,
+//! Lie-group math primitives, and a simple Earth gravity model.
 //!
 //! # Conventions
 //!
@@ -11,6 +11,14 @@
 //! - Velocities are meters per second.
 //! - NED vectors are ordered `[north, east, down]`.
 //! - ECEF vectors use the conventional Earth-centered, Earth-fixed axes.
+//! - SE(3) twist helpers use `[translation, rotation]` ordering.
+//!
+//! # Linearization Helpers
+//!
+//! The crate includes analytic Jacobians for LLH-to-ECEF, ECEF-to-NED rotation,
+//! and ECEF gravity. These are intended for estimators and strapdown navigation
+//! code that need deterministic `no_std` primitives without pulling in full EKF
+//! state machinery.
 //!
 //! # Gravity Model
 //!
@@ -26,7 +34,7 @@ use core::f64::consts::FRAC_PI_2;
 use libm::{atan, atan2, cbrt, copysign, cos, fabs, sin, sqrt};
 
 extern crate nalgebra as na;
-use na::{Matrix3, Rotation3, UnitQuaternion, Vector3};
+use na::{Matrix3, Quaternion, Rotation3, SMatrix, UnitQuaternion, Vector3};
 
 pub struct Ellipsoid {
     a: f64,
@@ -65,6 +73,187 @@ fn nan_matrix3() -> Matrix3<f64> {
     )
 }
 
+/// Returns the skew-symmetric cross-product matrix for `v`.
+///
+/// For any vectors `v` and `w`, `skew(&v) * w == v.cross(&w)`.
+pub fn skew(v: &Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0)
+}
+
+/// Returns the active right-handed rotation matrix about the x-axis.
+pub fn rotx(angle: f64) -> Matrix3<f64> {
+    let s = sin(angle);
+    let c = cos(angle);
+
+    Matrix3::new(1.0, 0.0, 0.0, 0.0, c, -s, 0.0, s, c)
+}
+
+/// Returns the active right-handed rotation matrix about the y-axis.
+pub fn roty(angle: f64) -> Matrix3<f64> {
+    let s = sin(angle);
+    let c = cos(angle);
+
+    Matrix3::new(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c)
+}
+
+/// Returns the active right-handed rotation matrix about the z-axis.
+pub fn rotz(angle: f64) -> Matrix3<f64> {
+    let s = sin(angle);
+    let c = cos(angle);
+
+    Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0)
+}
+
+/// Wraps an angle in radians to the interval `[-pi, pi)`.
+pub fn wrap_to_pi(angle: f64) -> f64 {
+    if !angle.is_finite() {
+        return f64::NAN;
+    }
+
+    let pi = core::f64::consts::PI;
+    let two_pi = 2.0 * pi;
+    let wrapped = (angle + pi) % two_pi;
+    let wrapped = (wrapped + two_pi) % two_pi;
+
+    wrapped - pi
+}
+
+/// Returns the SO(3) exponential map for a rotation vector.
+///
+/// The input vector direction is the rotation axis and its norm is the rotation
+/// angle in radians.
+pub fn so3_exp(rotation_vector: &Vector3<f64>) -> Matrix3<f64> {
+    let theta_squared = rotation_vector.norm_squared();
+    let theta = sqrt(theta_squared);
+    let rotation_vector_skew = skew(rotation_vector);
+    let rotation_vector_skew_squared = rotation_vector_skew * rotation_vector_skew;
+
+    let (a, b) = if theta < 1.0e-8 {
+        let theta_fourth = theta_squared * theta_squared;
+        (
+            1.0 - theta_squared / 6.0 + theta_fourth / 120.0,
+            0.5 - theta_squared / 24.0 + theta_fourth / 720.0,
+        )
+    } else {
+        (sin(theta) / theta, (1.0 - cos(theta)) / theta_squared)
+    };
+
+    Matrix3::identity() + a * rotation_vector_skew + b * rotation_vector_skew_squared
+}
+
+/// Returns the SO(3) left Jacobian for a rotation vector.
+///
+/// This matrix maps translational components in the SE(3) exponential map and
+/// is also useful when linearizing rotation-vector perturbations.
+pub fn so3_left_jacobian(rotation_vector: &Vector3<f64>) -> Matrix3<f64> {
+    let theta_squared = rotation_vector.norm_squared();
+    let theta = sqrt(theta_squared);
+    let rotation_vector_skew = skew(rotation_vector);
+    let rotation_vector_skew_squared = rotation_vector_skew * rotation_vector_skew;
+
+    let (a, b) = if theta < 1.0e-6 {
+        let theta_fourth = theta_squared * theta_squared;
+        (
+            0.5 - theta_squared / 24.0 + theta_fourth / 720.0,
+            1.0 / 6.0 - theta_squared / 120.0 + theta_fourth / 5_040.0,
+        )
+    } else {
+        (
+            (1.0 - cos(theta)) / theta_squared,
+            (theta - sin(theta)) / (theta_squared * theta),
+        )
+    };
+
+    Matrix3::identity() + a * rotation_vector_skew + b * rotation_vector_skew_squared
+}
+
+/// Returns the SE(3) exponential map as `(rotation, translation)`.
+///
+/// The input convention is a twist ordered as `[translation, rotation_vector]`.
+/// The returned translation is `so3_left_jacobian(rotation_vector) * translation`.
+pub fn se3_exp(
+    translation: &Vector3<f64>,
+    rotation_vector: &Vector3<f64>,
+) -> (Matrix3<f64>, Vector3<f64>) {
+    (
+        so3_exp(rotation_vector),
+        so3_left_jacobian(rotation_vector) * translation,
+    )
+}
+
+/// Returns the 6-by-6 Lie algebra adjoint matrix for an SE(3) twist.
+///
+/// The twist convention is `[translation, rotation]`, with both components
+/// resolved in the same frame.
+pub fn ad_se3(translation: &Vector3<f64>, rotation: &Vector3<f64>) -> SMatrix<f64, 6, 6> {
+    let mut adjoint = SMatrix::<f64, 6, 6>::zeros();
+
+    adjoint
+        .fixed_view_mut::<3, 3>(0, 0)
+        .copy_from(&skew(rotation));
+    adjoint
+        .fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&skew(translation));
+    adjoint
+        .fixed_view_mut::<3, 3>(3, 3)
+        .copy_from(&skew(rotation));
+
+    adjoint
+}
+
+/// Applies an incremental rotation vector on the right side of a quaternion.
+///
+/// The returned quaternion is `quat * delta_q`, where `delta_q` is the unit
+/// quaternion represented by `rotation_vector`.
+pub fn quat_update_from_rotation_vector(
+    quat: &UnitQuaternion<f64>,
+    rotation_vector: &Vector3<f64>,
+) -> UnitQuaternion<f64> {
+    let angle_squared = rotation_vector.norm_squared();
+    let angle = sqrt(angle_squared);
+
+    let delta_quat = if angle > 1.0e-8 {
+        let half_angle = 0.5 * angle;
+        let vector_scale = sin(half_angle) / angle;
+        UnitQuaternion::from_quaternion(Quaternion::new(
+            cos(half_angle),
+            vector_scale * rotation_vector[0],
+            vector_scale * rotation_vector[1],
+            vector_scale * rotation_vector[2],
+        ))
+    } else {
+        let angle_fourth = angle_squared * angle_squared;
+        let vector_scale = 0.5 - angle_squared / 48.0 + angle_fourth / 3_840.0;
+        UnitQuaternion::from_quaternion(Quaternion::new(
+            1.0 - angle_squared / 8.0 + angle_fourth / 384.0,
+            vector_scale * rotation_vector[0],
+            vector_scale * rotation_vector[1],
+            vector_scale * rotation_vector[2],
+        ))
+    };
+
+    quat * delta_quat
+}
+
+/// Converts a quaternion to a 4x modified Rodrigues parameter vector.
+///
+/// The quaternion sign is chosen internally so the scalar component is
+/// non-negative, avoiding the MRP singularity for equivalent negative
+/// quaternion representations.
+pub fn quat_to_mrp4x(quat: &UnitQuaternion<f64>) -> Vector3<f64> {
+    let quat = quat.quaternion();
+    let scalar = quat.scalar();
+    let vector = quat.vector();
+
+    let mrp = if scalar >= 0.0 {
+        vector / (1.0 + scalar)
+    } else {
+        -vector / (1.0 - scalar)
+    };
+
+    4.0 * mrp
+}
+
 /// Converts geodetic latitude, longitude, and ellipsoidal height to ECEF.
 ///
 /// `lat` and `lon` are in radians. `height` is height above the WGS84
@@ -83,6 +272,37 @@ pub fn lat_lon_height_to_ecef(lat: f64, lon: f64, height: f64) -> Vector3<f64> {
         (radius_n + height) * cos_lat * sin_lon,
         (radius_n * (1.0 - WGS84_E2) + height) * sin_lat,
     )
+}
+
+/// Returns the Jacobian of [`lat_lon_height_to_ecef`].
+///
+/// Columns are partial derivatives with respect to `[lat, lon, height]`.
+pub fn lat_lon_height_to_ecef_jacobian(lat: f64, lon: f64, height: f64) -> Matrix3<f64> {
+    let sin_lat = sin(lat);
+    let cos_lat = cos(lat);
+    let sin_lon = sin(lon);
+    let cos_lon = cos(lon);
+
+    let denom = 1.0 - WGS84_E2 * sin_lat * sin_lat;
+    let sqrt_denom = sqrt(denom);
+    let radius_n = WGS84.a / sqrt_denom;
+    let radius_n_dlat = WGS84.a * WGS84_E2 * sin_lat * cos_lat / (denom * sqrt_denom);
+
+    let common_lat = radius_n_dlat * cos_lat - (radius_n + height) * sin_lat;
+    let lat_col = Vector3::new(
+        common_lat * cos_lon,
+        common_lat * sin_lon,
+        radius_n_dlat * (1.0 - WGS84_E2) * sin_lat
+            + (radius_n * (1.0 - WGS84_E2) + height) * cos_lat,
+    );
+    let lon_col = Vector3::new(
+        -(radius_n + height) * cos_lat * sin_lon,
+        (radius_n + height) * cos_lat * cos_lon,
+        0.0,
+    );
+    let height_col = Vector3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+
+    Matrix3::from_columns(&[lat_col, lon_col, height_col])
 }
 
 /// Computes the transport rate of the NED frame relative to ECEF, resolved in NED.
@@ -114,6 +334,31 @@ pub fn omega_en_n(lat: f64, height: f64, vel_eb_n: Vector3<f64>) -> Vector3<f64>
         -vel_eb_n[0] / radius_n_height,
         -vel_eb_n[1] * sin_lat / (cos_lat * radius_e_height),
     )
+}
+
+/// Returns Earth rotation rate resolved in ECEF.
+pub fn earth_rate_ecef() -> Vector3<f64> {
+    Vector3::new(0.0, 0.0, EARTH_ROTATION_RATE)
+}
+
+/// Returns Earth rotation rate resolved in local NED.
+///
+/// Longitude is accepted for API symmetry with other local-frame helpers, but
+/// the resolved Earth-rate vector is independent of longitude.
+pub fn earth_rate_ned(lat: f64, _lon: f64) -> Vector3<f64> {
+    Vector3::new(
+        EARTH_ROTATION_RATE * cos(lat),
+        0.0,
+        -EARTH_ROTATION_RATE * sin(lat),
+    )
+}
+
+/// Computes inertial rate of the NED frame resolved in NED.
+///
+/// This is `omega_in_n = omega_ie_n + omega_en_n`, where `omega_ie_n` is Earth
+/// rotation resolved in NED and `omega_en_n` is the transport rate.
+pub fn omega_in_n(lat: f64, height: f64, vel_eb_n: Vector3<f64>) -> Vector3<f64> {
+    earth_rate_ned(lat, 0.0) + omega_en_n(lat, height, vel_eb_n)
 }
 
 /// Computes apparent gravity in ECEF at an ECEF position.
@@ -257,6 +502,46 @@ pub fn rot_ned_ecef(lat: f64, lon: f64) -> Matrix3<f64> {
     )
 }
 
+/// Returns `d rot_ned_ecef(lat, lon) / d lat`.
+pub fn rot_ned_ecef_jacobian_lat(lat: f64, lon: f64) -> Matrix3<f64> {
+    let sin_lat = sin(lat);
+    let cos_lat = cos(lat);
+    let sin_lon = sin(lon);
+    let cos_lon = cos(lon);
+
+    Matrix3::new(
+        -cos_lat * cos_lon,
+        -cos_lat * sin_lon,
+        -sin_lat,
+        0.0,
+        0.0,
+        0.0,
+        sin_lat * cos_lon,
+        sin_lat * sin_lon,
+        -cos_lat,
+    )
+}
+
+/// Returns `d rot_ned_ecef(lat, lon) / d lon`.
+pub fn rot_ned_ecef_jacobian_lon(lat: f64, lon: f64) -> Matrix3<f64> {
+    let sin_lat = sin(lat);
+    let cos_lat = cos(lat);
+    let sin_lon = sin(lon);
+    let cos_lon = cos(lon);
+
+    Matrix3::new(
+        sin_lat * sin_lon,
+        -sin_lat * cos_lon,
+        0.0,
+        -cos_lon,
+        -sin_lon,
+        0.0,
+        cos_lat * sin_lon,
+        -cos_lat * cos_lon,
+        0.0,
+    )
+}
+
 /// Returns the direction cosine matrix that maps NED vectors into ECEF vectors.
 pub fn rot_ecef_ned(lat: f64, lon: f64) -> Matrix3<f64> {
     rot_ned_ecef(lat, lon).transpose()
@@ -345,6 +630,18 @@ mod tests {
         }
     }
 
+    fn assert_matrix6_relative_eq(
+        lhs: &SMatrix<f64, 6, 6>,
+        rhs: &SMatrix<f64, 6, 6>,
+        epsilon: f64,
+    ) {
+        for row in 0..6 {
+            for col in 0..6 {
+                assert_relative_eq!(lhs[(row, col)], rhs[(row, col)], epsilon = epsilon);
+            }
+        }
+    }
+
     fn finite_difference_gravity_gradient(pos_ecef: &Vector3<f64>, step: f64) -> Matrix3<f64> {
         let mut gradient = Matrix3::zeros();
 
@@ -361,6 +658,211 @@ mod tests {
         }
 
         gradient
+    }
+
+    fn finite_difference_llh_to_ecef_jacobian(lat: f64, lon: f64, height: f64) -> Matrix3<f64> {
+        let mut jacobian = Matrix3::zeros();
+        let steps = [1.0e-6, 1.0e-6, 0.25];
+
+        for col in 0..3 {
+            let mut plus = [lat, lon, height];
+            let mut minus = [lat, lon, height];
+            plus[col] += steps[col];
+            minus[col] -= steps[col];
+
+            let pos_plus = lat_lon_height_to_ecef(plus[0], plus[1], plus[2]);
+            let pos_minus = lat_lon_height_to_ecef(minus[0], minus[1], minus[2]);
+            let diff = (pos_plus - pos_minus) / (2.0 * steps[col]);
+
+            for row in 0..3 {
+                jacobian[(row, col)] = diff[row];
+            }
+        }
+
+        jacobian
+    }
+
+    fn finite_difference_rot_lat(lat: f64, lon: f64, step: f64) -> Matrix3<f64> {
+        (rot_ned_ecef(lat + step, lon) - rot_ned_ecef(lat - step, lon)) / (2.0 * step)
+    }
+
+    fn finite_difference_rot_lon(lat: f64, lon: f64, step: f64) -> Matrix3<f64> {
+        (rot_ned_ecef(lat, lon + step) - rot_ned_ecef(lat, lon - step)) / (2.0 * step)
+    }
+
+    #[test]
+    fn skew_matches_cross_product() {
+        let v = Vector3::new(1.0, -2.0, 0.5);
+        let w = Vector3::new(-0.25, 0.75, 3.0);
+
+        assert_relative_eq!(skew(&v) * w, v.cross(&w), epsilon = 1.0e-12);
+        assert_matrix_relative_eq(&skew(&v), &(-skew(&v).transpose()), 1.0e-12);
+    }
+
+    #[test]
+    fn axis_rotation_helpers_have_right_handed_signs() {
+        let x = Vector3::new(1.0, 0.0, 0.0);
+        let y = Vector3::new(0.0, 1.0, 0.0);
+        let z = Vector3::new(0.0, 0.0, 1.0);
+
+        assert_relative_eq!(rotx(FRAC_PI_2) * y, z, epsilon = 1.0e-12);
+        assert_relative_eq!(rotx(FRAC_PI_2) * z, -y, epsilon = 1.0e-12);
+        assert_relative_eq!(roty(FRAC_PI_2) * z, x, epsilon = 1.0e-12);
+        assert_relative_eq!(roty(FRAC_PI_2) * x, -z, epsilon = 1.0e-12);
+        assert_relative_eq!(rotz(FRAC_PI_2) * x, y, epsilon = 1.0e-12);
+        assert_relative_eq!(rotz(FRAC_PI_2) * y, -x, epsilon = 1.0e-12);
+    }
+
+    #[test]
+    fn wrap_to_pi_uses_half_open_interval() {
+        assert_relative_eq!(wrap_to_pi(0.0), 0.0, epsilon = 0.0);
+        assert_relative_eq!(wrap_to_pi(PI), -PI, epsilon = 0.0);
+        assert_relative_eq!(wrap_to_pi(-PI), -PI, epsilon = 0.0);
+        assert_relative_eq!(wrap_to_pi(3.0 * PI), -PI, epsilon = 0.0);
+        assert_relative_eq!(wrap_to_pi(-3.0 * PI), -PI, epsilon = 0.0);
+        assert_relative_eq!(wrap_to_pi(5.0 * PI / 2.0), PI / 2.0, epsilon = 1.0e-12);
+        assert!(wrap_to_pi(f64::INFINITY).is_nan());
+    }
+
+    #[test]
+    fn so3_exp_matches_axis_rotations_and_small_angle_series() {
+        let angle = 0.4;
+        assert_matrix_relative_eq(
+            &so3_exp(&Vector3::new(angle, 0.0, 0.0)),
+            &rotx(angle),
+            1.0e-12,
+        );
+        assert_matrix_relative_eq(
+            &so3_exp(&Vector3::new(0.0, angle, 0.0)),
+            &roty(angle),
+            1.0e-12,
+        );
+        assert_matrix_relative_eq(
+            &so3_exp(&Vector3::new(0.0, 0.0, angle)),
+            &rotz(angle),
+            1.0e-12,
+        );
+
+        let small = Vector3::new(1.0e-9, -2.0e-9, 3.0e-9);
+        let small_skew = skew(&small);
+        let expected = Matrix3::identity() + small_skew + 0.5 * small_skew * small_skew;
+        assert_matrix_relative_eq(&so3_exp(&small), &expected, 1.0e-24);
+    }
+
+    #[test]
+    fn so3_left_jacobian_matches_small_angle_series() {
+        let small = Vector3::new(1.0e-7, -2.0e-7, 3.0e-7);
+        let small_skew = skew(&small);
+        let expected = Matrix3::identity() + 0.5 * small_skew + small_skew * small_skew / 6.0;
+
+        assert_matrix_relative_eq(&so3_left_jacobian(&small), &expected, 1.0e-20);
+    }
+
+    #[test]
+    fn se3_exp_matches_known_rotation_and_translation() {
+        let translation = Vector3::new(1.0, 0.5, 0.3);
+        let rotation = Vector3::new(0.3, 0.3, 0.3);
+        let (rot, trans) = se3_exp(&translation, &rotation);
+
+        let expected_rot = Matrix3::new(
+            0.9120, -0.2427, 0.3307, 0.3307, 0.9120, -0.2427, -0.2427, 0.3307, 0.9120,
+        );
+        let expected_trans = Vector3::new(0.9529, 0.6071, 0.2400);
+
+        assert_matrix_relative_eq(&rot, &expected_rot, 1.0e-4);
+        assert_relative_eq!(trans, expected_trans, epsilon = 1.0e-4);
+
+        let zero_rotation = Vector3::zeros();
+        let (identity, unchanged_translation) = se3_exp(&translation, &zero_rotation);
+        assert_matrix_relative_eq(&identity, &Matrix3::identity(), 1.0e-12);
+        assert_relative_eq!(unchanged_translation, translation, epsilon = 1.0e-12);
+    }
+
+    #[test]
+    fn ad_se3_has_expected_twist_action() {
+        use crate::na::SVector;
+
+        let translation = Vector3::new(0.4, -0.2, 0.8);
+        let rotation = Vector3::new(0.1, 0.2, -0.3);
+        let other_translation = Vector3::new(-0.5, 0.7, 1.2);
+        let other_rotation = Vector3::new(0.3, -0.4, 0.5);
+        let other_twist = SVector::<f64, 6>::new(
+            other_translation[0],
+            other_translation[1],
+            other_translation[2],
+            other_rotation[0],
+            other_rotation[1],
+            other_rotation[2],
+        );
+
+        let mut expected_ad = SMatrix::<f64, 6, 6>::zeros();
+        expected_ad
+            .fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&skew(&rotation));
+        expected_ad
+            .fixed_view_mut::<3, 3>(0, 3)
+            .copy_from(&skew(&translation));
+        expected_ad
+            .fixed_view_mut::<3, 3>(3, 3)
+            .copy_from(&skew(&rotation));
+        assert_matrix6_relative_eq(&ad_se3(&translation, &rotation), &expected_ad, 1.0e-12);
+
+        let actual = expected_ad * other_twist;
+        let expected_translation =
+            rotation.cross(&other_translation) + translation.cross(&other_rotation);
+        let expected_rotation = rotation.cross(&other_rotation);
+        let expected = SVector::<f64, 6>::new(
+            expected_translation[0],
+            expected_translation[1],
+            expected_translation[2],
+            expected_rotation[0],
+            expected_rotation[1],
+            expected_rotation[2],
+        );
+
+        assert_relative_eq!(actual, expected, epsilon = 1.0e-12);
+    }
+
+    #[test]
+    fn quat_update_from_rotation_vector_matches_so3_exp() {
+        let rotation_vector = Vector3::new(0.1, -0.2, 0.3);
+        let updated =
+            quat_update_from_rotation_vector(&UnitQuaternion::identity(), &rotation_vector);
+
+        assert_matrix_relative_eq(
+            updated.to_rotation_matrix().matrix(),
+            &so3_exp(&rotation_vector),
+            1.0e-12,
+        );
+
+        let base =
+            UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(rotz(0.2)));
+        let delta = Vector3::new(0.0, 0.0, 0.1);
+        let updated = quat_update_from_rotation_vector(&base, &delta);
+
+        assert_matrix_relative_eq(updated.to_rotation_matrix().matrix(), &rotz(0.3), 1.0e-12);
+    }
+
+    #[test]
+    fn quat_to_mrp4x_uses_equivalent_positive_scalar_quaternion() {
+        let identity_negative =
+            UnitQuaternion::from_quaternion(Quaternion::new(-1.0, 0.0, 0.0, 0.0));
+        assert_relative_eq!(
+            quat_to_mrp4x(&identity_negative),
+            Vector3::zeros(),
+            epsilon = 1.0e-12
+        );
+
+        let half_angle = PI / 4.0;
+        let quat = UnitQuaternion::from_quaternion(Quaternion::new(
+            cos(half_angle),
+            0.0,
+            0.0,
+            sin(half_angle),
+        ));
+        let expected = Vector3::new(0.0, 0.0, 4.0 * sin(half_angle) / (1.0 + cos(half_angle)));
+
+        assert_relative_eq!(quat_to_mrp4x(&quat), expected, epsilon = 1.0e-12);
     }
 
     #[test]
@@ -389,6 +891,24 @@ mod tests {
             Vector3::new(2.859253e6, 0.504163e6, 5.660022e6),
             epsilon = 1.0
         );
+    }
+
+    #[test]
+    fn lat_lon_height_to_ecef_jacobian_matches_central_difference() {
+        let cases = [
+            (0.0, 0.0, 0.0),
+            (deg(63.0), deg(10.0), 50.0),
+            (deg(-45.0), deg(170.0), 1_000.0),
+            (deg(80.0), deg(-30.0), 10.0),
+            (deg(20.0), deg(-70.0), 1.0e6),
+        ];
+
+        for (lat, lon, height) in cases {
+            let analytic = lat_lon_height_to_ecef_jacobian(lat, lon, height);
+            let finite_difference = finite_difference_llh_to_ecef_jacobian(lat, lon, height);
+
+            assert_matrix_relative_eq(&analytic, &finite_difference, 5.0e-3);
+        }
     }
 
     #[test]
@@ -421,12 +941,58 @@ mod tests {
 
     #[test]
     fn gravity_gradient_matches_central_difference() {
-        let p_eb = Vector3::new(2.859253e6, 0.504163e6, 5.660022e6);
-        let analytic = gravity_gradient_ecef(&p_eb);
-        let finite_difference = finite_difference_gravity_gradient(&p_eb, 10.0);
+        let cases = [
+            Vector3::new(2.859253e6, 0.504163e6, 5.660022e6),
+            lat_lon_height_to_ecef(0.0, 0.0, 0.0),
+            lat_lon_height_to_ecef(deg(-45.0), deg(170.0), 1_000.0),
+            lat_lon_height_to_ecef(deg(80.0), deg(-30.0), 10.0),
+            lat_lon_height_to_ecef(deg(20.0), deg(-70.0), 1.0e6),
+        ];
 
-        assert_matrix_relative_eq(&analytic, &finite_difference, 1.0e-10);
-        assert_matrix_relative_eq(&analytic, &analytic.transpose(), 1.0e-12);
+        for p_eb in cases {
+            let analytic = gravity_gradient_ecef(&p_eb);
+            let finite_difference = finite_difference_gravity_gradient(&p_eb, 10.0);
+
+            assert_matrix_relative_eq(&analytic, &finite_difference, 1.0e-10);
+            assert_matrix_relative_eq(&analytic, &analytic.transpose(), 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn earth_rate_helpers_resolve_rate_in_expected_frames() {
+        let lat = deg(63.0);
+        let lon = deg(10.0);
+        let expected_ned = Vector3::new(
+            EARTH_ROTATION_RATE * cos(lat),
+            0.0,
+            -EARTH_ROTATION_RATE * sin(lat),
+        );
+
+        assert_relative_eq!(
+            earth_rate_ecef(),
+            Vector3::new(0.0, 0.0, EARTH_ROTATION_RATE),
+            epsilon = 0.0
+        );
+        assert_relative_eq!(earth_rate_ned(lat, lon), expected_ned, epsilon = 1.0e-20);
+        assert_relative_eq!(
+            earth_rate_ned(lat, lon),
+            rot_ned_ecef(lat, lon) * earth_rate_ecef(),
+            epsilon = 1.0e-20
+        );
+    }
+
+    #[test]
+    fn omega_in_n_is_earth_rate_plus_transport_rate() {
+        let lat = deg(63.0);
+        let height = 50.0;
+        let vel_eb_n = Vector3::new(12.0, -3.0, 0.5);
+        let expected = earth_rate_ned(lat, 0.0) + omega_en_n(lat, height, vel_eb_n);
+
+        assert_relative_eq!(
+            omega_in_n(lat, height, vel_eb_n),
+            expected,
+            epsilon = 1.0e-20
+        );
     }
 
     #[test]
@@ -524,6 +1090,19 @@ mod tests {
             assert_matrix_relative_eq(&(ned_ecef * ecef_ned), &identity, 1.0e-12);
             assert_matrix_relative_eq(&(ned_ecef * ned_ecef.transpose()), &identity, 1.0e-12);
             assert_matrix_relative_eq(&(ecef_ned * ecef_ned.transpose()), &identity, 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn rot_ned_ecef_jacobians_match_central_difference() {
+        for (lat, lon) in [(0.0, 0.0), (deg(63.0), deg(10.0)), (deg(-30.0), deg(140.0))] {
+            let lat_analytic = rot_ned_ecef_jacobian_lat(lat, lon);
+            let lon_analytic = rot_ned_ecef_jacobian_lon(lat, lon);
+            let lat_finite_difference = finite_difference_rot_lat(lat, lon, 1.0e-7);
+            let lon_finite_difference = finite_difference_rot_lon(lat, lon, 1.0e-7);
+
+            assert_matrix_relative_eq(&lat_analytic, &lat_finite_difference, 3.0e-9);
+            assert_matrix_relative_eq(&lon_analytic, &lon_finite_difference, 3.0e-9);
         }
     }
 
