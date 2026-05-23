@@ -1,6 +1,6 @@
 [package]
 name = "navigation_toolbox"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 homepage = "https://github.com/erlendbasso/navigation_toolbox"
@@ -13,5 +13,7 @@ keywords = ["navigation", "gnss", "no_std"]
 [dependencies]
 # nalgebra = "0.32"
 nalgebra = {version = "0.34", default-features = false, features = ["libm"]}
-approx = "0.5.1"
 libm = "0.2"
+
+[dev-dependencies]
+approx = "0.5.1"
