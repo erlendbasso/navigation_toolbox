@@ -543,6 +543,15 @@ pub fn rot_ned_ecef_jacobian_lon(lat: f64, lon: f64) -> Matrix3<f64> {
 }
 
 /// Returns the direction cosine matrix that maps NED vectors into ECEF vectors.
+///
+/// For a NED-resolved vector `v_n`, `rot_ecef_ned(lat, lon) * v_n` gives the
+/// same vector resolved in ECEF coordinates.  This is the transpose (inverse)
+/// of [`rot_ned_ecef`].
+///
+/// **Naming convention**: function names in this module follow the pattern
+/// `rot_<output>_<input>`, so `rot_ecef_ned` maps *from* NED *into* ECEF.
+/// This is the same convention used by `rot_ned_ecef` (maps from ECEF into
+/// NED).  Reading the suffix left-to-right gives the output frame first.
 pub fn rot_ecef_ned(lat: f64, lon: f64) -> Matrix3<f64> {
     rot_ned_ecef(lat, lon).transpose()
 }
