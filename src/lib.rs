@@ -30,6 +30,8 @@
 //! The functions preserve the original simple API and return NaNs for invalid or
 //! singular inputs such as the ECEF origin or exact NED poles.
 
+pub mod geoid;
+
 use core::f64::consts::FRAC_PI_2;
 use libm::{atan, atan2, cbrt, copysign, cos, fabs, sin, sqrt};
 
